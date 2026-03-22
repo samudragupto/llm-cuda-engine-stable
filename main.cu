@@ -9,9 +9,9 @@ int main() {
     model.load_weights("model_mixed.bin");
 
     std::vector<std::vector<int>> concurrent_prompts = {
-        {1, 450, 7483, 310, 3444, 338}, 
-        {1, 450, 7483, 310, 28705, 338}, 
-        {1, 450, 7483, 310, 5635, 338}  
+        {1, 450, 7483, 310, 3444, 338},  // "The capital of France is"
+        {1, 450, 7483, 310, 4363, 338},  // "The capital of Japan is" (Assuming 4363 is Japan)
+        {1, 450, 7483, 310, 5634, 338}   // "The capital of Germany is" (Assuming 5634 is Germany)
     };
     
     GenerationConfig cfg;
