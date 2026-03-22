@@ -230,3 +230,92 @@ void k_copy(float* src, float* dst, int n) {}
 void k_gemm_naive(float* A, float* B, float* C, int M, int N, int K) {}
 void k_transpose(float* in, float* out, int rows, int cols) {}
 void k_linear(float* x, float* W, float* y, int in_features, int out_features) {}
+
+
+__global__ void _paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache,
+                                int* block_table, int pos, int block_size, int kv_dim) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= kv_dim) return;
+
+    int logical_block_idx = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int physical_block_idx = block_table[logical_block_idx];
+
+    int target_idx = physical_block_idx * (block_size * kv_dim) + (offset_in_block * kv_dim) + d;
+
+    k_cache[target_idx] = k_src[d];
+    v_cache[target_idx] = v_src[d];
+}
+
+void k_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, 
+                      int* block_table, int pos, int block_size, int dim) {
+    _paged_kv_write<<<(dim + 255) / 256, 256>>>(k_src, v_src, k_cache, v_cache, block_table, pos, block_size, dim);
+}
+
+__global__ void _paged_mha_scores(half* q, half* K_cache, float* s, 
+                                  int* block_table, int pos, int block_size,
+                                  int n_heads, int n_kv_heads, int head_dim) {
+    int h = blockIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x; // c is logical position (0 to pos)
+
+    if (h < n_heads && c <= pos) {
+        // Find Physical Block for token 'c'
+        int logical_block_idx = c / block_size;
+        int offset = c % block_size;
+        int physical_block_idx = block_table[logical_block_idx];
+
+        int kv_h = h / (n_heads / n_kv_heads); // Grouped Query Attention handling
+        int q_base = h * head_dim;
+        
+        int kv_dim = n_kv_heads * head_dim;
+        int k_base = physical_block_idx * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+
+        // Dot Product
+        float sum = 0.0f;
+        for(int d=0; d < head_dim; d++) {
+            sum += __half2float(q[q_base+d]) * __half2float(K_cache[k_base+d]);
+        }
+        
+        // S Matrix is still logically contiguous for the Softmax step!
+        s[h * 4096 + c] = sum / sqrtf((float)head_dim);
+    }
+}
+
+void k_paged_mha_scores(half* q, half* K_cache, float* s, 
+                        int* block_table, int pos, int block_size, 
+                        int n_heads, int n_kv_heads, int head_dim) {
+    dim3 g((4096)/256, n_heads), b(256);
+    _paged_mha_scores<<<g, b>>>(q, K_cache, s, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
+}
+
+__global__ void _paged_mha_weighted_sum(float* p, half* V_cache, half* o, 
+                                        int* block_table, int pos, int block_size,
+                                        int n_heads, int n_kv_heads, int head_dim) {
+    int h = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (h < n_heads && d < head_dim) {
+        float sum = 0.0f; 
+        int kv_h = h / (n_heads / n_kv_heads);
+        int kv_dim = n_kv_heads * head_dim;
+
+        // Loop over all historical tokens
+        for(int c=0; c <= pos; c++) {
+            int logical_block_idx = c / block_size;
+            int offset = c % block_size;
+            int physical_block_idx = block_table[logical_block_idx];
+
+            int v_base = physical_block_idx * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+
+            sum += p[h * 4096 + c] * __half2float(V_cache[v_base+d]);
+        }
+        o[h * head_dim + d] = __float2half(sum);
+    }
+}
+
+void k_paged_mha_weighted_sum(float* p, half* V_cache, half* o, 
+                              int* block_table, int pos, int block_size, 
+                              int n_heads, int n_kv_heads, int head_dim) {
+    dim3 g((head_dim+255)/256, n_heads), b(256);
+    _paged_mha_weighted_sum<<<g, b>>>(p, V_cache, o, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
+}

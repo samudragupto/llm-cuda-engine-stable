@@ -17,6 +17,10 @@ void k_half_llama_rope_graph(half* x, int n_heads, int head_dim, int* d_pos);
 void k_half_copy_to_cache_graph(half* src, half* cache, int* d_pos, int dim);
 void k_row_softmax_graph(float* x, float* y, int n_heads, int* d_pos);
 
+void k_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, int* block_table, int pos, int block_size, int dim);
+void k_paged_mha_scores(half* q, half* K_cache, float* s, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim);
+void k_paged_mha_weighted_sum(float* p, half* V_cache, half* o, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim);
+
 void k_half_rmsnorm(half* x, half* w, half* y, int rows, int cols, float eps);
 void k_half_fused_add_rmsnorm(half* x, half* res, half* w, half* out, int rows, int cols, float eps);
 void k_half_llama_rope(half* x, int seq, int n_heads, int head_dim, int pos_base);
