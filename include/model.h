@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <string>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include "tensor.h"
@@ -33,5 +34,6 @@ struct Llama2Paged {
 
     Llama2Paged(MemPool& pool);
     void load_weights(const char* path);
-    void chat_batched(MemPool& scratch, const std::vector<std::vector<int>>& prompts, GenerationConfig cfg);
+    void prefill(MemPool& scratch, const std::vector<int>& prompt_ids);
+    std::vector<std::string> chat_batched(MemPool& scratch, const std::vector<std::vector<int>>& prompts, GenerationConfig cfg);
 };

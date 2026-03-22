@@ -61,7 +61,19 @@ void Llama2Paged::load_weights(const char* path) {
     fclose(f); 
 }
 
-void Llama2Paged::chat_batched(MemPool& scratch, const std::vector<std::vector<int>>& prompts, GenerationConfig cfg) {
+void Llama2Paged::prefill(MemPool& scratch, const std::vector<int>& prompt_ids) {
+    int seq = prompt_ids.size(); int* d_ids = scratch.alloc<int>(seq + (seq % 4 == 0 ? 0 : 4 - (seq % 4))); 
+    cudaMemcpyAsync(d_ids, prompt_ids.data(), seq * sizeof(int), cudaMemcpyHostToDevice, 0); 
+    HalfTensor x(scratch, {seq, dim}), tmp(scratch, {seq, dim});
+    k_half_embedding_lookup(d_ids, tok_embed.data, x.data, seq, dim);
+    for (int i=0; i<layers; i++) {
+        k_half_rmsnorm(x.data, transformer[i]->w_rms1.data, tmp.data, seq, dim, 1e-5f);
+        k_half_copy(tmp.data, x.data, seq * dim);
+    }
+    cudaStreamSynchronize(0);
+}
+
+std::vector<std::string> Llama2Paged::chat_batched(MemPool& scratch, const std::vector<std::vector<int>>& prompts, GenerationConfig cfg) {
     int batch_size = prompts.size();
     std::vector<int> positions(batch_size, 0);
     std::vector<int> tokens(batch_size, 0);
@@ -158,10 +170,10 @@ void Llama2Paged::chat_batched(MemPool& scratch, const std::vector<std::vector<i
     std::chrono::duration<double> dt = t2 - t1;
 
     for (int b = 0; b < batch_size; b++) {
-        printf("\n=== USER %d ===\n", b+1);
-        for(int id : prompts[b]) printf("%s", tokenizer.decode(id).c_str());
-        printf("%s\n", generated_texts[b].c_str());
         kv_manager.free_sequence(b);
     }
+    
     if (tokens_generated > 0) printf("\n[Batched Decode Speed: %.2f tok/s]\n", tokens_generated / dt.count());
+
+    return generated_texts;
 }
