@@ -2,14 +2,12 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-// --- CORE UTILS ---
 __global__ void _half_to_float(half* src, float* dst, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = __half2float(src[i]); }
 void k_half_to_float(half* src, float* dst, int n) { _half_to_float<<<(n+255)/256, 256>>>(src, dst, n); }
 
 __global__ void _half_copy(half* src, half* dst, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = src[i]; }
 void k_half_copy(half* src, half* dst, int n) { _half_copy<<<(n+255)/256, 256>>>(src, dst, n); }
 
-// --- INT8 & FP16 MATRIX MATH ---
 __global__ void _half_gemv(half* x, half* W, half* y, int in_features, int out_features) {
     int row = blockIdx.x; if (row >= out_features) return;
     float sum = 0.0f; int w_base = row * in_features;
@@ -45,13 +43,11 @@ void k_half_linear(cublasHandle_t handle, half* x, half* W, half* y, int b, int 
     cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_features, b, in_features, &alpha, W, in_features, x, in_features, &beta, y, out_features); 
 }
 
-// --- STABLE PREFILL ATTENTION ---
 __global__ void _stable_attention_prefill(half* Q, half* K, half* V, half* O, int seq, int n_heads, int n_kv_heads, int head_dim) {
     int h = blockIdx.y, r = blockIdx.x; if (r >= seq) return;
     int kv_h = h / (n_heads / n_kv_heads), q_base = r * (n_heads * head_dim) + h * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim), max_score = -1e20f;
     float scores[2048]; 
-    
     for (int c = 0; c <= r; c++) {
         int k_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
         float s = 0.0f;
@@ -74,14 +70,12 @@ void k_flash_attention_prefill(half* Q, half* K, half* V, half* O, int seq, int 
     dim3 g(seq, n_heads); _stable_attention_prefill<<<g, 1>>>(Q, K, V, O, seq, n_heads, n_kv_heads, head_dim); 
 }
 
-// --- CUDA GRAPH DECODE KERNELS (Fixed 4096 Stride) ---
 __global__ void _half_mha_scores_one_graph(half* q, half* K_cache, float* s, int* d_pos, int n_heads, int n_kv_heads, int head_dim) {
     int h = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x, pos = *d_pos;
     if (h < n_heads && c <= pos) {
         float sum = 0.0f; int kv_h = h / (n_heads / n_kv_heads);
         int q_base = h * head_dim, k_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
         for(int d=0; d < head_dim; d++) sum += __half2float(q[q_base+d]) * __half2float(K_cache[k_base+d]);
-        // FIX: Matrix S is allocated as [n_heads x 4096]. Stride must be 4096!
         s[h * 4096 + c] = sum / sqrtf((float)head_dim);
     }
 }
@@ -93,10 +87,7 @@ __global__ void _half_mha_weighted_sum_one_graph(float* p, half* V_cache, half* 
     int h = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x, pos = *d_pos;
     if (h < n_heads && d < head_dim) {
         float sum = 0.0f; int kv_h = h / (n_heads / n_kv_heads);
-        for(int c=0; c <= pos; c++) {
-            // FIX: Matrix P stride is 4096
-            sum += p[h * 4096 + c] * __half2float(V_cache[c*(n_kv_heads*head_dim)+kv_h*head_dim+d]);
-        }
+        for(int c=0; c <= pos; c++) sum += p[h * 4096 + c] * __half2float(V_cache[c*(n_kv_heads*head_dim)+kv_h*head_dim+d]);
         o[h*head_dim+d] = __float2half(sum);
     }
 }
@@ -109,7 +100,6 @@ __global__ void _row_softmax_graph(float* x, float* y, int n_heads, int* d_pos) 
     if (r >= n_heads) return;
     __shared__ float m, s;
     if (threadIdx.x == 0) { 
-        // FIX: Matrix stride is 4096
         float mx = x[r * 4096]; 
         for (int i = 1; i < cols; i++) if (x[r * 4096 + i] > mx) mx = x[r * 4096 + i]; 
         float sm = 0.0f; 
@@ -117,9 +107,7 @@ __global__ void _row_softmax_graph(float* x, float* y, int n_heads, int* d_pos) 
         m = mx; s = sm; 
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        y[r * 4096 + i] = expf(x[r * 4096 + i] - m) / s;
-    }
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) y[r * 4096 + i] = expf(x[r * 4096 + i] - m) / s;
 }
 void k_row_softmax_graph(float* x, float* y, int n_heads, int* d_pos) { _row_softmax_graph<<<n_heads, 256>>>(x, y, n_heads, d_pos); }
 
@@ -140,7 +128,130 @@ __global__ void _half_copy_to_cache_graph(half* src, half* cache, int* d_pos, in
 }
 void k_half_copy_to_cache_graph(half* src, half* cache, int* d_pos, int dim) { _half_copy_to_cache_graph<<<(dim + 255) / 256, 256>>>(src, cache, d_pos, dim); }
 
-// --- UTILS (NON-GRAPH) ---
+__global__ void _paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, int* block_table, int pos, int block_size, int kv_dim) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= kv_dim) return;
+    int logical = pos / block_size, offset = pos % block_size, phys = block_table[logical];
+    int target = phys * (block_size * kv_dim) + (offset * kv_dim) + d;
+    k_cache[target] = k_src[d]; v_cache[target] = v_src[d];
+}
+void k_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, int* block_table, int pos, int block_size, int dim) {
+    _paged_kv_write<<<(dim + 255) / 256, 256>>>(k_src, v_src, k_cache, v_cache, block_table, pos, block_size, dim);
+}
+
+__global__ void _paged_mha_scores(half* q, half* K_cache, float* s, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim) {
+    int h = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (h < n_heads && c <= pos) {
+        int logical = c / block_size, offset = c % block_size, phys = block_table[logical];
+        int kv_h = h / (n_heads / n_kv_heads), q_base = h * head_dim, kv_dim = n_kv_heads * head_dim;
+        int k_base = phys * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+        float sum = 0.0f;
+        for(int d=0; d < head_dim; d++) sum += __half2float(q[q_base+d]) * __half2float(K_cache[k_base+d]);
+        s[h * 4096 + c] = sum / sqrtf((float)head_dim);
+    }
+}
+void k_paged_mha_scores(half* q, half* K_cache, float* s, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim) {
+    dim3 g((4096)/256, n_heads), b(256);
+    _paged_mha_scores<<<g, b>>>(q, K_cache, s, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
+}
+
+__global__ void _paged_mha_weighted_sum(float* p, half* V_cache, half* o, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim) {
+    int h = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (h < n_heads && d < head_dim) {
+        float sum = 0.0f; int kv_h = h / (n_heads / n_kv_heads), kv_dim = n_kv_heads * head_dim;
+        for(int c=0; c <= pos; c++) {
+            int logical = c / block_size, offset = c % block_size, phys = block_table[logical];
+            int v_base = phys * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+            sum += p[h * 4096 + c] * __half2float(V_cache[v_base+d]);
+        }
+        o[h * head_dim + d] = __float2half(sum);
+    }
+}
+void k_paged_mha_weighted_sum(float* p, half* V_cache, half* o, int* block_table, int pos, int block_size, int n_heads, int n_kv_heads, int head_dim) {
+    dim3 g((head_dim+255)/256, n_heads), b(256);
+    _paged_mha_weighted_sum<<<g, b>>>(p, V_cache, o, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
+}
+
+__global__ void _batched_llama_rope(half* x, int* d_pos, int n_heads, int head_dim) {
+    int b = blockIdx.z, h = blockIdx.y, i = threadIdx.x, pos = d_pos[b];
+    if (h < n_heads && i < head_dim / 2) {
+        int base = b * (n_heads * head_dim) + h * head_dim;
+        float x0 = __half2float(x[base+i]), x1 = __half2float(x[base+i+head_dim/2]);
+        float th = pos * powf(10000.0f, -(2.0f * i) / head_dim);
+        x[base+i] = __float2half(x0*cosf(th) - x1*sinf(th)); x[base+i+head_dim/2] = __float2half(x0*sinf(th) + x1*cosf(th));
+    }
+}
+void k_batched_llama_rope(half* x, int* d_pos, int n_heads, int head_dim, int batch_size) {
+    dim3 g(1, n_heads, batch_size);
+    _batched_llama_rope<<<g, head_dim / 2>>>(x, d_pos, n_heads, head_dim);
+}
+
+__global__ void _batched_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, int* block_table, int* d_pos, int block_size, int kv_dim, int max_blocks) {
+    int b = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= kv_dim) return;
+    int pos = d_pos[b], logical = pos / block_size, offset = pos % block_size;
+    int phys = block_table[b * max_blocks + logical];
+    int target = phys * (block_size * kv_dim) + (offset * kv_dim) + d, src = b * kv_dim + d;
+    k_cache[target] = k_src[src]; v_cache[target] = v_src[src];
+}
+void k_batched_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, int* block_table, int* d_pos, int block_size, int kv_dim, int max_blocks, int batch_size) {
+    dim3 g((kv_dim + 255) / 256, batch_size);
+    _batched_paged_kv_write<<<g, 256>>>(k_src, v_src, k_cache, v_cache, block_table, d_pos, block_size, kv_dim, max_blocks);
+}
+
+__global__ void _batched_paged_mha_scores(half* q, half* K_cache, float* s, int* block_table, int* d_pos, int block_size, int n_heads, int n_kv_heads, int head_dim, int max_blocks) {
+    int b = blockIdx.z, h = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x, pos = d_pos[b];
+    if (h < n_heads && c <= pos) {
+        int logical = c / block_size, offset = c % block_size, phys = block_table[b * max_blocks + logical];
+        int kv_h = h / (n_heads / n_kv_heads), q_base = b * (n_heads * head_dim) + h * head_dim, kv_dim = n_kv_heads * head_dim;
+        int k_base = phys * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+        float sum = 0.0f;
+        for(int d=0; d < head_dim; d++) sum += __half2float(q[q_base+d]) * __half2float(K_cache[k_base+d]);
+        s[b * (n_heads * 4096) + h * 4096 + c] = sum / sqrtf((float)head_dim);
+    }
+}
+void k_batched_paged_mha_scores(half* q, half* K_cache, float* s, int* block_table, int* d_pos, int block_size, int n_heads, int n_kv_heads, int head_dim, int max_blocks, int batch_size) {
+    dim3 g((4096)/256, n_heads, batch_size);
+    _batched_paged_mha_scores<<<g, 256>>>(q, K_cache, s, block_table, d_pos, block_size, n_heads, n_kv_heads, head_dim, max_blocks);
+}
+
+__global__ void _batched_row_softmax(float* x, float* y, int n_heads, int* d_pos) {
+    int b = blockIdx.y, r = blockIdx.x, pos = d_pos[b], cols = pos + 1;
+    if (r >= n_heads) return;
+    int row_idx = b * (n_heads * 4096) + r * 4096;
+    __shared__ float m, s;
+    if (threadIdx.x == 0) { 
+        float mx = x[row_idx]; 
+        for (int i = 1; i < cols; i++) if (x[row_idx + i] > mx) mx = x[row_idx + i]; 
+        float sm = 0.0f; 
+        for (int i = 0; i < cols; i++) sm += expf(x[row_idx + i] - mx); 
+        m = mx; s = sm; 
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) y[row_idx + i] = expf(x[row_idx + i] - m) / s;
+}
+void k_batched_row_softmax(float* x, float* y, int n_heads, int* d_pos, int batch_size) {
+    dim3 g(n_heads, batch_size);
+    _batched_row_softmax<<<g, 256>>>(x, y, n_heads, d_pos);
+}
+
+__global__ void _batched_paged_mha_sum(float* p, half* V_cache, half* o, int* block_table, int* d_pos, int block_size, int n_heads, int n_kv_heads, int head_dim, int max_blocks) {
+    int b = blockIdx.z, h = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x, pos = d_pos[b];
+    if (h < n_heads && d < head_dim) {
+        float sum = 0.0f; int kv_h = h / (n_heads / n_kv_heads), kv_dim = n_kv_heads * head_dim;
+        for(int c=0; c <= pos; c++) {
+            int logical = c / block_size, offset = c % block_size, phys = block_table[b * max_blocks + logical];
+            int v_base = phys * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
+            sum += p[b * (n_heads * 4096) + h * 4096 + c] * __half2float(V_cache[v_base+d]);
+        }
+        o[b * (n_heads * head_dim) + h * head_dim + d] = __float2half(sum);
+    }
+}
+void k_batched_paged_mha_sum(float* p, half* V_cache, half* o, int* block_table, int* d_pos, int block_size, int n_heads, int n_kv_heads, int head_dim, int max_blocks, int batch_size) {
+    dim3 g((head_dim+255)/256, n_heads, batch_size);
+    _batched_paged_mha_sum<<<g, 256>>>(p, V_cache, o, block_table, d_pos, block_size, n_heads, n_kv_heads, head_dim, max_blocks);
+}
+
 __global__ void _half_rmsnorm(half* x, half* w, half* y, int rows, int cols, float eps) {
     int r = blockIdx.x; if (r >= rows) return;
     __shared__ float s;
@@ -188,134 +299,5 @@ void k_half_embedding_lookup(int* ids, half* table, half* out, int seq, int dim)
 __global__ void _half_copy_block_to_cache(half* src, half* cache, int pos_base, int seq_len, int dim) { int seq_idx = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x; if (seq_idx < seq_len && d < dim) cache[(pos_base + seq_idx) * dim + d] = src[seq_idx * dim + d]; }
 void k_half_copy_block_to_cache(half* src, half* cache, int pos_base, int seq_len, int dim) { dim3 g((dim+255)/256, seq_len), b(256); _half_copy_block_to_cache<<<g, b>>>(src, cache, pos_base, seq_len, dim); }
 
-__global__ void _half_argmax_row(half* x, int* out, int rows, int cols) { int r = blockIdx.x; if (r < rows && threadIdx.x == 0) { int idx = 0; float best = __half2float(x[r*cols]); for (int i=1; i<cols; i++) { float val = __half2float(x[r*cols+i]); if (val > best) { best = val; idx = i; } } out[r] = idx; } }
-void k_half_argmax_row(half* x, int* out, int rows, int cols) { _half_argmax_row<<<rows, 1>>>(x, out, rows, cols); }
-
 __global__ void _argmax_row(float* x, int* out, int rows, int cols) { int r = blockIdx.x; if (r < rows && threadIdx.x == 0) { int idx = 0; float best = x[r*cols]; for (int i=1; i<cols; i++) { if (x[r*cols+i] > best) { best = x[r*cols+i]; idx = i; } } out[r] = idx; } }
 void k_argmax_row(float* x, int* out, int rows, int cols) { _argmax_row<<<rows, 1>>>(x, out, rows, cols); }
-
-__global__ void _row_softmax(float* x, float* y, int rows, int cols) { int r = blockIdx.x; if (r >= rows) return; __shared__ float m, s; if (threadIdx.x == 0) { float mx = x[r * cols]; for (int i = 1; i < cols; i++) if (x[r * cols + i] > mx) mx = x[r * cols + i]; float sm = 0.0f; for (int i = 0; i < cols; i++) sm += expf(x[r * cols + i] - mx); m = mx; s = sm; } __syncthreads(); for (int i = threadIdx.x; i < cols; i += blockDim.x) y[r * cols + i] = expf(x[r * cols + i] - m) / s; }
-void k_row_softmax(float* x, float* y, int rows, int cols) { _row_softmax<<<rows, 256>>>(x, y, rows, cols); }
-
-// STUBS
-void k_cublas_gemm(cublasHandle_t handle, float* A, float* B, float* C, int M, int N, int K) {}
-void k_fp32_to_fp16(float* src, half* dst, int n) {}
-void k_gemm_wmma(half* A, half* B, float* C, int M, int N, int K) {}
-void k_apply_temperature(float* logits, float temp, int vocab_size) {}
-void k_sample_top_p(float* probs, int* out_idx, float p, float random_val, int vocab_size) {}
-void k_apply_repetition_penalty(float* logits, int* past_tokens, int num_past, float penalty) {}
-void k_gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {}
-void k_add(float* a, float* b, float* c, int n) {}
-void k_rmsnorm(float* x, float* w, float* y, int rows, int cols, float eps) {}
-void k_silu(float* x, float* y, int n) {}
-void k_swiglu(float* gate, float* up, float* out, int n) {}
-void k_rope(float* x, int seq, int dim, int pos_base) {}
-void k_attention_scores(float* Q, float* K, float* S, int seq, int dim) {}
-void k_apply_causal_mask(float* S, int seq) {}
-void k_attention_weighted_sum(float* P, float* V, float* O, int seq, int dim) {}
-void k_mha_scores_fused_mask(float* Q, float* K, float* S, int seq, int n_heads, int n_kv_heads, int head_dim) {}
-void k_mha_weighted_sum(float* P, float* V, float* O, int seq, int n_heads, int n_kv_heads, int head_dim) {}
-void k_mha_scores_one(float* q, float* K_cache, float* s, int pos, int n_heads, int n_kv_heads, int head_dim) {}
-void k_mha_weighted_sum_one(float* p, float* V_cache, float* o, int pos, int n_heads, int n_kv_heads, int head_dim) {}
-void k_embedding_lookup(int* ids, float* table, float* out, int seq, int dim) {}
-void k_gather_last_token(float* x, float* out, int seq, int dim) {}
-void k_row_add_bias(float* x, float* b, int rows, int cols) {}
-void k_copy_row_to_cache(float* src_row, float* cache, int pos, int dim) {}
-void k_gemv(float* x, float* W, float* y, int K, int N) {}
-void k_fused_add_rmsnorm(float* x, float* residual_in, float* w, float* norm_out, int rows, int cols, float eps) {}
-void k_mul(float* a, float* b, float* c, int n) {}
-void k_scale(float* a, float s, float* c, int n) {}
-void k_fill(float* a, float val, int n) {}
-void k_copy(float* src, float* dst, int n) {}
-void k_gemm_naive(float* A, float* B, float* C, int M, int N, int K) {}
-void k_transpose(float* in, float* out, int rows, int cols) {}
-void k_linear(float* x, float* W, float* y, int in_features, int out_features) {}
-
-
-__global__ void _paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache,
-                                int* block_table, int pos, int block_size, int kv_dim) {
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= kv_dim) return;
-
-    int logical_block_idx = pos / block_size;
-    int offset_in_block = pos % block_size;
-    int physical_block_idx = block_table[logical_block_idx];
-
-    int target_idx = physical_block_idx * (block_size * kv_dim) + (offset_in_block * kv_dim) + d;
-
-    k_cache[target_idx] = k_src[d];
-    v_cache[target_idx] = v_src[d];
-}
-
-void k_paged_kv_write(half* k_src, half* v_src, half* k_cache, half* v_cache, 
-                      int* block_table, int pos, int block_size, int dim) {
-    _paged_kv_write<<<(dim + 255) / 256, 256>>>(k_src, v_src, k_cache, v_cache, block_table, pos, block_size, dim);
-}
-
-__global__ void _paged_mha_scores(half* q, half* K_cache, float* s, 
-                                  int* block_table, int pos, int block_size,
-                                  int n_heads, int n_kv_heads, int head_dim) {
-    int h = blockIdx.y;
-    int c = blockIdx.x * blockDim.x + threadIdx.x; // c is logical position (0 to pos)
-
-    if (h < n_heads && c <= pos) {
-        // Find Physical Block for token 'c'
-        int logical_block_idx = c / block_size;
-        int offset = c % block_size;
-        int physical_block_idx = block_table[logical_block_idx];
-
-        int kv_h = h / (n_heads / n_kv_heads); // Grouped Query Attention handling
-        int q_base = h * head_dim;
-        
-        int kv_dim = n_kv_heads * head_dim;
-        int k_base = physical_block_idx * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
-
-        // Dot Product
-        float sum = 0.0f;
-        for(int d=0; d < head_dim; d++) {
-            sum += __half2float(q[q_base+d]) * __half2float(K_cache[k_base+d]);
-        }
-        
-        // S Matrix is still logically contiguous for the Softmax step!
-        s[h * 4096 + c] = sum / sqrtf((float)head_dim);
-    }
-}
-
-void k_paged_mha_scores(half* q, half* K_cache, float* s, 
-                        int* block_table, int pos, int block_size, 
-                        int n_heads, int n_kv_heads, int head_dim) {
-    dim3 g((4096)/256, n_heads), b(256);
-    _paged_mha_scores<<<g, b>>>(q, K_cache, s, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
-}
-
-__global__ void _paged_mha_weighted_sum(float* p, half* V_cache, half* o, 
-                                        int* block_table, int pos, int block_size,
-                                        int n_heads, int n_kv_heads, int head_dim) {
-    int h = blockIdx.y;
-    int d = blockIdx.x * blockDim.x + threadIdx.x; 
-
-    if (h < n_heads && d < head_dim) {
-        float sum = 0.0f; 
-        int kv_h = h / (n_heads / n_kv_heads);
-        int kv_dim = n_kv_heads * head_dim;
-
-        // Loop over all historical tokens
-        for(int c=0; c <= pos; c++) {
-            int logical_block_idx = c / block_size;
-            int offset = c % block_size;
-            int physical_block_idx = block_table[logical_block_idx];
-
-            int v_base = physical_block_idx * (block_size * kv_dim) + (offset * kv_dim) + (kv_h * head_dim);
-
-            sum += p[h * 4096 + c] * __half2float(V_cache[v_base+d]);
-        }
-        o[h * head_dim + d] = __float2half(sum);
-    }
-}
-
-void k_paged_mha_weighted_sum(float* p, half* V_cache, half* o, 
-                              int* block_table, int pos, int block_size, 
-                              int n_heads, int n_kv_heads, int head_dim) {
-    dim3 g((head_dim+255)/256, n_heads), b(256);
-    _paged_mha_weighted_sum<<<g, b>>>(p, V_cache, o, block_table, pos, block_size, n_heads, n_kv_heads, head_dim);
-}

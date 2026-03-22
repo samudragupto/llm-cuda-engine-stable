@@ -8,13 +8,17 @@ int main() {
     Llama2Paged model(model_pool);
     model.load_weights("model_mixed.bin");
 
-    std::vector<int> prompt = {1, 450, 7483, 310, 3444, 338}; 
+    std::vector<std::vector<int>> concurrent_prompts = {
+        {1, 450, 7483, 310, 3444, 338}, 
+        {1, 450, 7483, 310, 28705, 338}, 
+        {1, 450, 7483, 310, 5635, 338}  
+    };
     
     GenerationConfig cfg;
     cfg.max_new_tokens = 50;
     cfg.repetition_penalty = 1.1f;
 
-    model.chat(scratch_pool, prompt, cfg);
+    model.chat_batched(scratch_pool, concurrent_prompts, cfg);
 
     return 0;
 }
