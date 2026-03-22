@@ -10,6 +10,7 @@
 struct GenerationConfig { 
     int max_new_tokens = 50; 
     float repetition_penalty = 1.1f; 
+    float temperature = 1.0f;
 };
 
 struct LlamaLayerPaged {
@@ -20,11 +21,11 @@ struct LlamaLayerPaged {
 
     LlamaLayerPaged(MemPool& pool, int d, int hd, int nh, int nkv, int tb, int bs);
     void load(FILE* f);
-    void forward_decode_batched(MemPool& scratch, cublasHandle_t handle, HalfTensor& x, int* d_pos, int* d_block_table, int batch_size, int max_blocks_per_seq);
+    void forward_decode_batched(MemPool& scratch, cublasHandle_t handle, HalfTensor& x, int* d_pos, int* d_block_table, int batch_size, int max_blocks_per_seq, int max_seq_len);
 };
 
 struct Llama2Paged {
-    int vocab=32000, dim=2048, hidden=5632, layers=22, heads=32, kv_heads=4, max_seq=256;
+    int vocab=32000, dim=2048, hidden=5632, layers=22, heads=32, kv_heads=4, max_seq=2048;
     int total_blocks=1024, block_size=16; 
     HalfTensor tok_embed, norm_w, lm_head;
     std::vector<LlamaLayerPaged*> transformer;
@@ -34,6 +35,5 @@ struct Llama2Paged {
 
     Llama2Paged(MemPool& pool);
     void load_weights(const char* path);
-    void prefill(MemPool& scratch, const std::vector<int>& prompt_ids);
     std::vector<std::string> chat_batched(MemPool& scratch, const std::vector<std::vector<int>>& prompts, GenerationConfig cfg);
 };

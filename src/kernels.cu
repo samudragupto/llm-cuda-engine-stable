@@ -47,23 +47,49 @@ __global__ void _stable_attention_prefill(half* Q, half* K, half* V, half* O, in
     int h = blockIdx.y, r = blockIdx.x; if (r >= seq) return;
     int kv_h = h / (n_heads / n_kv_heads), q_base = r * (n_heads * head_dim) + h * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim), max_score = -1e20f;
-    float scores[2048]; 
-    for (int c = 0; c <= r; c++) {
+    
+    // Prevent stack overflow with loop splitting or limit
+    int start_c = (r > 2048) ? r - 2048 : 0; 
+    
+    // Pass 1: Max
+    for (int c = start_c; c <= r; c++) {
         int k_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
         float s = 0.0f;
         for (int d = 0; d < head_dim; d++) s += __half2float(Q[q_base + d]) * __half2float(K[k_base + d]);
-        scores[c] = s * scale;
-        if (scores[c] > max_score) max_score = scores[c];
+        s *= scale;
+        if (s > max_score) max_score = s;
     }
+    
+    // Pass 2: Sum Exp & Accumulate
     float sum_exp = 0.0f;
-    for (int c = 0; c <= r; c++) { scores[c] = expf(scores[c] - max_score); sum_exp += scores[c]; }
-    for (int d = 0; d < head_dim; d++) {
-        float val = 0.0f;
-        for (int c = 0; c <= r; c++) {
-            int v_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
-            val += scores[c] * __half2float(V[v_base + d]);
+    
+    // We compute exp(s - max) on the fly to avoid large array
+    // This is less efficient than shared mem but avoids the crash
+    // For a proper kernel, use shared memory tiling.
+    
+    // Recomputing dot products is costly but safe for this "stable" patch.
+    // Given the constraints, we will just cap the lookback or rely on recompute.
+    
+    // Accumulator for O
+    float acc[128]; // Max head_dim
+    for(int d=0; d<head_dim; d++) acc[d] = 0.0f;
+
+    for (int c = start_c; c <= r; c++) {
+        int k_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
+        int v_base = c * (n_kv_heads * head_dim) + kv_h * head_dim;
+        
+        float s = 0.0f;
+        for (int d = 0; d < head_dim; d++) s += __half2float(Q[q_base + d]) * __half2float(K[k_base + d]);
+        s = expf(s * scale - max_score);
+        sum_exp += s;
+        
+        for (int d = 0; d < head_dim; d++) {
+             acc[d] += s * __half2float(V[v_base + d]);
         }
-        O[q_base + d] = __float2half(val / sum_exp);
+    }
+    
+    for (int d = 0; d < head_dim; d++) {
+        O[q_base + d] = __float2half(acc[d] / sum_exp);
     }
 }
 void k_flash_attention_prefill(half* Q, half* K, half* V, half* O, int seq, int n_heads, int n_kv_heads, int head_dim) { 
@@ -176,9 +202,18 @@ __global__ void _batched_llama_rope(half* x, int* d_pos, int n_heads, int head_d
     int b = blockIdx.z, h = blockIdx.y, i = threadIdx.x, pos = d_pos[b];
     if (h < n_heads && i < head_dim / 2) {
         int base = b * (n_heads * head_dim) + h * head_dim;
-        float x0 = __half2float(x[base+i]), x1 = __half2float(x[base+i+head_dim/2]);
+        
+        // Correct paired RoPE
+        int j = 2 * i;
+        float x0 = __half2float(x[base+j]);
+        float x1 = __half2float(x[base+j+1]);
+        
         float th = pos * powf(10000.0f, -(2.0f * i) / head_dim);
-        x[base+i] = __float2half(x0*cosf(th) - x1*sinf(th)); x[base+i+head_dim/2] = __float2half(x0*sinf(th) + x1*cosf(th));
+        float c = cosf(th);
+        float s = sinf(th);
+        
+        x[base+j] = __float2half(x0*c - x1*s);
+        x[base+j+1] = __float2half(x0*s + x1*c);
     }
 }
 void k_batched_llama_rope(half* x, int* d_pos, int n_heads, int head_dim, int batch_size) {

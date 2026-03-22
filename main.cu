@@ -1,73 +1,62 @@
-#include "memory_pool.h"
 #include "model.h"
-#include "httplib.h"
-#include "json.hpp"
 #include <iostream>
-
-using json = nlohmann::json;
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 int main() {
-    printf("Initializing GPU Memory Pools...\n");
-    MemPool model_pool(2ULL * 1024 * 1024 * 1024);   
-    MemPool scratch_pool(256ULL * 1024 * 1024);      
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 
-    printf("Loading LLaMA Engine...\n");
+    printf("Initializing GPU Memory Pools...\n");
+    MemPool model_pool(2ULL * 1024 * 1024 * 1024);
+    MemPool scratch_pool(256ULL * 1024 * 1024);
+
+    printf("Loading LLaMA Engine (INT8/FP16)...\n");
     Llama2Paged model(model_pool);
     model.load_weights("model_mixed.bin");
 
-    httplib::Server svr;
+    printf("\n================================================\n");
+    printf("Custom LLM Engine Ready!\n");
+    printf("Type your prompt and press Enter. Type '/bye' to exit.\n");
+    printf("(Supported keywords for demo: France, Japan, Germany, life)\n");
+    printf("================================================\n\n");
 
-    svr.Post("/v1/completions", [&](const httplib::Request& req, httplib::Response& res) {
-        try {
-            auto body = json::parse(req.body);
-            std::string prompt_text = body.value("prompt", "");
-            int max_tokens = body.value("max_tokens", 50);
+    GenerationConfig cfg;
+    cfg.max_new_tokens = 60;
+    cfg.repetition_penalty = 1.1f;
+    cfg.temperature = 1.0f;
 
-            printf("\n[API] Received Prompt: '%s'\n", prompt_text.c_str());
+    std::string user_input;
+    while (true) {
+        std::cout << "\n>>> You: ";
+        std::getline(std::cin, user_input);
 
-            std::vector<int> prompt_ids;
-            if (prompt_text.find("France") != std::string::npos) {
-                prompt_ids = {1, 450, 7483, 310, 3444, 338}; 
-            } else if (prompt_text.find("Japan") != std::string::npos) {
-                prompt_ids = {1, 450, 7483, 310, 4363, 338}; 
-            } else {
-                prompt_ids = {1, 450, 7483, 310, 3444, 338}; 
-            }
-
-            std::vector<std::vector<int>> batch = { prompt_ids };
-            
-            GenerationConfig cfg;
-            cfg.max_new_tokens = max_tokens;
-            cfg.repetition_penalty = 1.1f;
-            
-            std::vector<std::string> results = model.chat_batched(scratch_pool, batch, cfg);
-
-            json response;
-            response["id"] = "cmpl-custom";
-            response["object"] = "text_completion";
-            response["model"] = "tinyllama-int8";
-            response["choices"] = json::array();
-            
-            json choice;
-            choice["text"] = results[0];
-            choice["index"] = 0;
-            response["choices"].push_back(choice);
-
-            res.set_content(response.dump(4), "application/json");
-
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(std::string("{\"error\": \"") + e.what() + "\"}", "application/json");
+        if (user_input == "/bye" || user_input == "exit") {
+            printf("Shutting down.\n");
+            break;
         }
-    });
 
-    printf("\n=========================================\n");
-    printf("Custom LLM Server running on port 8085!\n");
-    printf("=========================================\n");
-    
-    if (!svr.listen("0.0.0.0", 8085)) {
-        printf("[FATAL] Failed to start server! Port 8085 is already in use.\n");
-        return 1;
+        if (user_input.empty()) continue;
+
+        std::vector<int> prompt_ids = {1}; 
+
+        if (user_input == "France") {
+             prompt_ids = {1, 450, 7483, 310, 3444, 338}; 
+        } else if (user_input == "Japan") {
+             prompt_ids = {1, 450, 7483, 310, 4363, 338}; 
+        } else if (user_input == "Germany") {
+             prompt_ids = {1, 450, 7483, 310, 5634, 338};
+        } else if (user_input == "life") {
+             prompt_ids = {1, 1724, 338, 263, 2983, 29889};
+        } else {
+             prompt_ids = {1, 450, 7483, 310, 3444, 338}; 
+        }
+
+        std::vector<std::vector<int>> batch = { prompt_ids };
+        model.chat_batched(scratch_pool, batch, cfg);
     }
 
     return 0;
