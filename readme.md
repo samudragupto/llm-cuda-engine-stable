@@ -60,13 +60,13 @@ The result is a compact but instructive inference runtime that demonstrates how 
 1. High-Level System Architecture
 ```mermaid
 graph TB
-    subgraph USER_LAYER["🖥️ User Interface Layer"]
+    subgraph USER_LAYER["User Interface Layer"]
         CLI["CLI Interface<br/>./llm-engine --model llama-7b --prompt 'Hello'"]
         HTTP["HTTP API Server<br/>(Optional REST endpoint)"]
         STREAM["Streaming Token Output<br/>Token-by-token callback"]
     end
 
-    subgraph HOST_LAYER["🧠 Host Layer (CPU)"]
+    subgraph HOST_LAYER["Host Layer (CPU)"]
         CONFIG["Config Parser<br/>Read model config.json<br/>n_layers, n_heads, dim, vocab_size"]
         WEIGHT_LOADER["Weight Loader<br/>Safetensors / GGUF Parser<br/>Memory-mapped file I/O"]
         TOKENIZER["BPE Tokenizer<br/>Vocabulary + Merge Rules<br/>Encode / Decode"]
@@ -74,7 +74,7 @@ graph TB
         SAMPLER["Token Sampler<br/>Temperature / Top-K / Top-P<br/>Repetition penalty"]
     end
 
-    subgraph DEVICE_LAYER["⚡ Device Layer (GPU)"]
+    subgraph DEVICE_LAYER["Device Layer (GPU)"]
         MEM_MGR["GPU Memory Manager<br/>Pool allocator<br/>Lifetime tracking"]
         KERNEL_LIB["CUDA Kernel Library<br/>All custom kernels"]
         ATTENTION_ENGINE["Attention Engine<br/>Naive → Flash → Paged"]
@@ -82,7 +82,7 @@ graph TB
         QUANT_ENGINE["Quantization Engine<br/>INT8/INT4 dequant kernels"]
     end
 
-    subgraph OPTIMIZATION_LAYER["🚀 Optimization Layer"]
+    subgraph OPTIMIZATION_LAYER["Optimization Layer"]
         FUSION["Kernel Fusion Engine<br/>Combine adjacent kernels"]
         CUDA_GRAPHS["CUDA Graphs<br/>Capture & replay decode step"]
         TENSOR_PARALLEL["Tensor Parallelism<br/>Multi-GPU NCCL sharding"]
@@ -124,7 +124,7 @@ graph TB
 
     EMB --> LAYER_LOOP
 
-    subgraph LAYER_LOOP["🔁 Repeat × N_LAYERS (e.g., 32 for LLaMA-7B)"]
+    subgraph LAYER_LOOP[" Repeat × N_LAYERS (e.g., 32 for LLaMA-7B)"]
 
         subgraph ATTN_BLOCK["Self-Attention Block"]
             RN1["RMSNorm Kernel<br/>Normalize hidden state"]
@@ -283,17 +283,17 @@ graph TB
 graph TB
     subgraph GPU_MEMORY["GPU Global Memory (e.g., 24GB RTX 4090)"]
 
-        subgraph STATIC["📦 Static Allocations (loaded once)"]
+        subgraph STATIC["Static Allocations (loaded once)"]
             WEIGHTS["Model Weights<br/>━━━━━━━━━━━━━━━━━━━<br/>embed_tokens.weight [vocab × dim]<br/>━━━━━━━━━━━━━━━━━━━<br/>Per Layer × 32:<br/>  attention.wq [dim × dim]<br/>  attention.wk [dim × kv_dim]<br/>  attention.wv [dim × kv_dim]<br/>  attention.wo [dim × dim]<br/>  feed_forward.w_gate [dim × ff_dim]<br/>  feed_forward.w_up [dim × ff_dim]<br/>  feed_forward.w_down [ff_dim × dim]<br/>  attention_norm [dim]<br/>  ffn_norm [dim]<br/>━━━━━━━━━━━━━━━━━━━<br/>norm.weight [dim]<br/>output.weight [dim × vocab]<br/>━━━━━━━━━━━━━━━━━━━<br/>≈ 13.5 GB (FP16, 7B model)"]
         end
 
-        subgraph DYNAMIC["🔄 Dynamic Allocations (per inference)"]
+        subgraph DYNAMIC["Dynamic Allocations (per inference)"]
             KV_POOL["KV-Cache Pool<br/>━━━━━━━━━━━━━━━━━━━<br/>Per Layer × 32:<br/>  K: [max_seq × n_kv_heads × head_dim]<br/>  V: [max_seq × n_kv_heads × head_dim]<br/>━━━━━━━━━━━━━━━━━━━<br/>Pre-allocated for max_seq_len<br/>≈ 2-8 GB depending on context"]
 
             ACTIVATIONS["Activation Buffers (Ping-Pong)<br/>━━━━━━━━━━━━━━━━━━━<br/>Buffer A: [batch × seq × dim]<br/>Buffer B: [batch × seq × dim]<br/>Q buffer: [batch × seq × dim]<br/>K buffer: [batch × seq × kv_dim]<br/>V buffer: [batch × seq × kv_dim]<br/>Attn buffer: [batch × n_heads × seq × seq]<br/>FFN buffer: [batch × seq × ff_dim]<br/>Logits: [batch × seq × vocab]<br/>━━━━━━━━━━━━━━━━━━━<br/>Reused every layer<br/>≈ 0.5-2 GB"]
         end
 
-        subgraph SCRATCH["🗑️ Scratch Space"]
+        subgraph SCRATCH["Scratch Space"]
             SOFTMAX_SCRATCH["Softmax Scratch<br/>Row max + row sum"]
             REDUCE_SCRATCH["Reduction Scratch<br/>Partial sums for norms"]
             SAMPLE_SCRATCH["Sampling Scratch<br/>Sorted logits, cumsum"]
@@ -317,45 +317,7 @@ graph TB
     style MEM_MANAGER fill:#533483,stroke:#e94560,stroke-width:2px,color:#fff
 ```
 5. Inference Execution Pipeline (Prefill vs Decode)
-graph LR
-    subgraph PREFILL["⚡ Phase A: PREFILL (Process entire prompt)"]
-        direction TB
-        P1["Tokenize prompt<br/>'Hello world' → [15496, 995]"]
-        P2["Embedding lookup<br/>[seq_len × dim]"]
-        P3["Run all layers<br/>seq_len tokens in PARALLEL<br/>(compute-bound)"]
-        P4["Populate KV-Cache<br/>All layers filled for prompt"]
-        P5["Get logits for LAST token only"]
-        P6["Sample first generated token"]
-
-        P1 --> P2 --> P3 --> P4 --> P5 --> P6
-    end
-
-    subgraph DECODE["🔁 Phase B: DECODE (One token at a time)"]
-        direction TB
-        D1["Embed single new token<br/>[1 × dim]"]
-        D2["Run all layers<br/>seq_len = 1<br/>(memory-bandwidth-bound)"]
-        D3["Append to KV-Cache<br/>1 new K,V per layer"]
-        D4["Attention over FULL cache<br/>Q=[1×dim], K,V=[pos×dim]"]
-        D5["Get logits, sample next token"]
-        D6{"EOS or<br/>max_len?"}
-        D7["Output token"]
-
-        D1 --> D2 --> D3 --> D4 --> D5 --> D6
-        D6 -->|"No"| D7 --> D1
-        D6 -->|"Yes"| DONE["Generation Complete"]
-    end
-
-    PREFILL -->|"First token<br/>generated"| DECODE
-
-    subgraph PERF_CHARS["Performance Characteristics"]
-        direction TB
-        PC1["PREFILL:<br/>• Processes N tokens at once<br/>• Large matrix multiplications<br/>• GPU compute fully utilized<br/>• Measured in tokens/sec (throughput)<br/>• Typically 1000-5000 tok/s"]
-        PC2["DECODE:<br/>• 1 token per step<br/>• Small GEMV operations<br/>• Memory bandwidth bottleneck<br/>• Measured in tokens/sec (latency)<br/>• Typically 30-150 tok/s"]
-    end
-
-    style PREFILL fill:#1a1a2e,stroke:#e94560,stroke-width:2px,color:#fff
-    style DECODE fill:#16213e,stroke:#0f3460,stroke-width:2px,color:#fff
-    style PERF_CHARS fill:#0d1117,stroke:#58a6ff,stroke-width:2px,color:#fff
+![Inference Execution Pipeline (Prefill vs Decode)](assets/inference.png)
 ```mermaid
 
 ```
@@ -391,7 +353,7 @@ graph TB
             FREE["Free Block List<br/>[6, 8, 10, 12, 13...]"]
         end
 
-        PK1["✅ No memory waste (allocate on demand)<br/>✅ Different sequences can have different lengths<br/>✅ Copy-on-write for beam search<br/>✅ Enables continuous batching"]
+        PK1[" No memory waste (allocate on demand)<br/> Different sequences can have different lengths<br/> Copy-on-write for beam search<br/> Enables continuous batching"]
     end
 
     subgraph QUANT_KV["V3: Quantized KV-Cache (Phase 4)"]
@@ -411,7 +373,7 @@ graph TB
 . Flash Attention v2 — Internal Architecture
 ```mermaid
 graph TB
-    subgraph OPT_PROGRESSION["📈 Optimization Progression (Expected tok/s on RTX 4090, LLaMA-7B)"]
+    subgraph OPT_PROGRESSION["Optimization Progression (Expected tok/s on RTX 4090, LLaMA-7B)"]
         direction LR
 
         V1["V1: Naive<br/>━━━━━━━<br/>Naive GEMM<br/>Naive Attention<br/>FP32<br/>━━━━━━━<br/>~5 tok/s<br/>decode"]
@@ -433,7 +395,7 @@ graph TB
         V1 -->|"3×"| V2 -->|"2.7×"| V3 -->|"1.4×"| V4 -->|"1.3×"| V5 -->|"1.4×"| V6 -->|"1.3×"| V7 -->|"1.1×"| V8
     end
 
-    subgraph COMPARISON["🏁 Final Comparison Target"]
+    subgraph COMPARISON["Final Comparison Target"]
         OURS["Our Engine<br/>~145 tok/s"]
         LLAMA_CPP["llama.cpp<br/>~130 tok/s<br/>(Q4_K_M)"]
         VLLM["vLLM<br/>~150 tok/s<br/>(single user)"]
@@ -520,49 +482,7 @@ sequenceDiagram
     CPU->>CPU: Sample next token
 ```
 9. Flash Attention v2 — Internal Architecture
-```
-graph TB
-    subgraph FLASH["⚡ Flash Attention v2 — Tiled Algorithm"]
-        direction TB
-
-        INPUT_FA["Inputs: Q[N×d], K[N×d], V[N×d]<br/>Block sizes: B_r (query block), B_c (kv block)"]
-
-        subgraph OUTER_LOOP["Outer Loop: Over Q blocks (i = 0..N/B_r)"]
-            LOAD_Q["Load Q_i block [B_r × d] into SRAM"]
-            INIT["Initialize:<br/>O_i = 0 [B_r × d]<br/>m_i = -∞ [B_r] (row max)<br/>l_i = 0 [B_r] (row sum)"]
-
-            subgraph INNER_LOOP["Inner Loop: Over KV blocks (j = 0..N/B_c)"]
-                LOAD_KV["Load K_j [B_c × d], V_j [B_c × d]<br/>from HBM to SRAM"]
-                COMPUTE_S["S_ij = Q_i × K_j^T<br/>[B_r × B_c]<br/>GEMM in SRAM"]
-                CAUSAL_CHECK["Apply causal mask<br/>(if j > i, mask out)"]
-                ROW_MAX["m̃_ij = rowmax(S_ij)<br/>[B_r]"]
-                NEW_MAX["m_new = max(m_i, m̃_ij)<br/>[B_r]"]
-                EXP_S["P̃_ij = exp(S_ij - m_new)<br/>[B_r × B_c]"]
-                ROW_SUM["l̃_ij = rowsum(P̃_ij)<br/>[B_r]"]
-                RESCALE["Rescale previous:<br/>l_new = exp(m_i - m_new) × l_i + l̃_ij<br/>O_i = diag(exp(m_i - m_new)) × O_i"]
-                UPDATE_O["O_i = O_i + P̃_ij × V_j<br/>[B_r × d]<br/>GEMM in SRAM"]
-                UPDATE_ML["m_i = m_new<br/>l_i = l_new"]
-            end
-
-            FINAL_SCALE["O_i = diag(1/l_i) × O_i<br/>Final scaling"]
-            WRITE_O["Write O_i [B_r × d] to HBM"]
-        end
-
-        KEY_INSIGHT["🔑 KEY INSIGHT:<br/>Never materialize N×N attention matrix!<br/>Memory: O(N) instead of O(N²)<br/>IO: O(N²d / SRAM_size) instead of O(N²d)<br/>All intermediate computation in SRAM (shared memory)"]
-    end
-
-    INPUT_FA --> LOAD_Q --> INIT
-    INIT --> LOAD_KV
-    LOAD_KV --> COMPUTE_S --> CAUSAL_CHECK --> ROW_MAX --> NEW_MAX
-    NEW_MAX --> EXP_S --> ROW_SUM --> RESCALE --> UPDATE_O --> UPDATE_ML
-    UPDATE_ML -->|"Next KV block"| LOAD_KV
-    UPDATE_ML -->|"All KV blocks done"| FINAL_SCALE --> WRITE_O
-    WRITE_O -->|"Next Q block"| LOAD_Q
-
-    style FLASH fill:#0d1117,stroke:#e94560,stroke-width:3px,color:#fff
-    style OUTER_LOOP fill:#1a1a2e,stroke:#58a6ff,stroke-width:2px,color:#fff
-    style INNER_LOOP fill:#16213e,stroke:#e94560,stroke-width:2px,color:#fff
-```
+![Flash Attention v2 — Internal Architecture](assets/flash.png)
 10. Multi-GPU Tensor Parallelism Architecture
 ```mermaid
 graph TB
@@ -618,7 +538,7 @@ graph TB
 11. Benchmarking Dashboard Architecture
 ```mermaid
 graph TB
-    subgraph BENCH_SYSTEM["📊 Benchmarking & Profiling System"]
+    subgraph BENCH_SYSTEM["Benchmarking & Profiling System"]
 
         subgraph METRICS["Metrics Collection"]
             M1["Tokens/Second (decode)"]
@@ -648,11 +568,11 @@ graph TB
         end
 
         subgraph OUTPUT["Output Artifacts"]
-            O1["📈 Optimization Progression Chart<br/>(tok/s vs optimization stage)"]
-            O2["📊 Comparison Bar Charts<br/>(our engine vs competitors)"]
-            O3["🔥 Roofline Model Plot<br/>(arithmetic intensity vs perf)"]
-            O4["📋 Kernel Breakdown Table<br/>(% time per kernel type)"]
-            O5["📝 Nsight Compute Reports<br/>(occupancy, cache hits, stalls)"]
+            O1["Optimization Progression Chart<br/>(tok/s vs optimization stage)"]
+            O2["Comparison Bar Charts<br/>(our engine vs competitors)"]
+            O3["Roofline Model Plot<br/>(arithmetic intensity vs perf)"]
+            O4["Kernel Breakdown Table<br/>(% time per kernel type)"]
+            O5["Nsight Compute Reports<br/>(occupancy, cache hits, stalls)"]
         end
 
         METRICS --> OUTPUT
@@ -767,6 +687,147 @@ A single request follows this path:
 11. response returned through JSON API
 
 ---
+## Experimental Evidence
+
+### OpenAI-Compatible HTTP Serving with GPU Inference
+The engine exposes a REST interface compatible with the `chat/completions` style API. Requests are accepted through the HTTP layer, tokenized in C++, executed through the CUDA inference runtime, and returned as structured JSON responses.
+
+![HTTP Server Demo](assets/http_server_demo.png)
+
+This validates the complete serving stack:
+- HTTP request parsing
+- JSON prompt extraction
+- tokenizer encode path
+- paged KV-cache allocation
+- GPU-backed autoregressive generation
+- JSON response serialization
+
+### CUDA Graph Decode Execution
+A graph-captured decode path was brought up to reduce kernel launch overhead and improve single-request token latency.
+
+![CUDA Graph Decode](assets/cuda_graph_decode_84tok.png)
+
+This benchmark demonstrates:
+- stable CUDA graph compilation
+- successful decode replay
+- integrated TinyLlama INT8 inference
+- measured decode throughput in the ~84 tok/s range
+
+### FlashAttention and Prefill/Decode Behavior
+The optimized inference path exhibits the expected separation between prompt prefill and autoregressive decode phases, matching the behavior of modern LLM serving systems.
+
+![FlashAttention Prefill Decode](assets/flashattention_prefill_decode.png)
+
+This validates:
+- distinct prefill throughput behavior
+- lower-latency token-by-token decode behavior
+- stable mixed-precision generation
+- end-to-end correctness under optimized attention flow
+
+---
+
+## Benchmark Snapshots
+
+### Kernel and GEMM Bring-Up
+Early benchmarking established baseline performance for elementwise operations, transpose kernels, custom GEMM implementations, and cuBLAS comparisons.
+
+![Phase 1 Benchmarks](assets/phase1_benchmarks.png)
+
+These results were used to validate:
+- memory bandwidth utilization on simple kernels
+- naive vs tiled GEMM speedups
+- tensor core WMMA progress
+- distance from cuBLAS ceilings
+
+### Benchmark Progression Philosophy
+The system was optimized incrementally:
+- establish correctness
+- benchmark primitive kernels
+- compare against cuBLAS
+- introduce tensor cores
+- split prefill vs decode
+- add quantization
+- integrate paged attention
+- expose server-facing inference
+
+This workflow mirrors practical systems research:
+- measure
+- profile
+- isolate bottlenecks
+- optimize the critical path
+- re-measure
+
+---
+
+## Serving Demo
+
+### End-to-End REST Inference
+The engine supports interactive request/response serving over HTTP using an OpenAI-style schema.
+
+![HTTP Server Demo](assets/http_server_demo.png)
+
+A typical serving cycle includes:
+1. receive user prompt through HTTP POST
+2. parse JSON request body
+3. encode text prompt to token IDs
+4. dispatch to CUDA inference engine
+5. generate tokens using paged KV-cache
+6. decode token IDs back to text
+7. return structured JSON response
+
+This demonstrates that the project is not only a kernel collection, but a complete inference runtime.
+
+### Decode Throughput in Server Mode
+The serving path also provides practical throughput metrics during real API-driven inference, showing that the architecture remains functional beyond synthetic benchmarks.
+
+Observed behavior includes:
+- stable request handling
+- successful model load from custom binary format
+- practical token generation speed
+- correct output flow through server and client
+
+---
+
+## Profiling and Validation
+
+### Early Profiling Summary
+The project includes kernel-level profiling summaries and memory-pool instrumentation used during foundation phases.
+
+![Profiling Summary](assets/phase1_profile_summary.png)
+
+This stage validated:
+- memory pool correctness
+- active allocation tracking
+- persistent vs scratch memory behavior
+- benchmark instrumentation plumbing
+- profiling output for later optimization work
+
+### Validation Strategy
+The implementation was validated in layers:
+
+- kernel correctness
+- memory allocator correctness
+- tensor shape consistency
+- weight loading integrity
+- tokenizer decoding cleanup
+- prompt-to-generation end-to-end behavior
+- HTTP response correctness
+
+### Performance Validation
+The benchmark and profiling snapshots collectively show:
+- custom kernel bring-up
+- progression toward high-throughput inference
+- stable decode execution under optimized settings
+- successful integration of CUDA graphs and paged attention paths
+
+### Systems-Level Validation
+These artifacts demonstrate that the engine is not just theoretically implemented, but experimentally exercised across:
+- local CLI generation
+- benchmark executables
+- profiling summaries
+- graph-captured decode
+- HTTP server deployment
+- real prompt/response inference
 
 ## Repository Structure
 
